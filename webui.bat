@@ -9,14 +9,21 @@ rem set HF_ENDPOINT=https://hf-mirror.com
 if not defined MPT_WEBUI_HOST set "MPT_WEBUI_HOST=127.0.0.1"
 if not defined MPT_WEBUI_PORT set "MPT_WEBUI_PORT=8501"
 
+rem Define machine-local environment to avoid Dropbox / cloud sync path conflicts across devices
+if not defined UV_PROJECT_ENVIRONMENT set "UV_PROJECT_ENVIRONMENT=%LOCALAPPDATA%\MoneyPrinterTurbo\.venv"
+
 set "STREAMLIT_CMD="
-if exist "%CURRENT_DIR%\.venv\Scripts\python.exe" (
+where uv >nul 2>nul
+if not errorlevel 1 (
+    set "STREAMLIT_CMD=uv run streamlit"
+) else if exist "%UV_PROJECT_ENVIRONMENT%\Scripts\python.exe" (
+    set "STREAMLIT_CMD="%UV_PROJECT_ENVIRONMENT%\Scripts\python.exe" -m streamlit"
+) else if exist "%CURRENT_DIR%\.venv\Scripts\python.exe" (
     set "STREAMLIT_CMD="%CURRENT_DIR%\.venv\Scripts\python.exe" -m streamlit"
+) else if exist "%CURRENT_DIR%\venv\Scripts\python.exe" (
+    set "STREAMLIT_CMD="%CURRENT_DIR%\venv\Scripts\python.exe" -m streamlit"
 ) else if exist "%CURRENT_DIR%\lib\python\python.exe" (
     set "STREAMLIT_CMD="%CURRENT_DIR%\lib\python\python.exe" -m streamlit"
-) else (
-    where uv >nul 2>nul
-    if not errorlevel 1 set "STREAMLIT_CMD=uv run streamlit"
 )
 
 if not defined STREAMLIT_CMD (

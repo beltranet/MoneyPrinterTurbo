@@ -16,12 +16,18 @@ export PYTHONPATH="$CURRENT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 MPT_WEBUI_HOST="${MPT_WEBUI_HOST:-127.0.0.1}"
 MPT_WEBUI_PORT="${MPT_WEBUI_PORT:-8501}"
 
-if [ -x "$CURRENT_DIR/.venv/bin/python" ]; then
-  PORT_CHECK_CMD="$CURRENT_DIR/.venv/bin/python"
-  set -- "$CURRENT_DIR/.venv/bin/python" -m streamlit
-elif command -v uv >/dev/null 2>&1; then
+UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$HOME/.local/share/MoneyPrinterTurbo/.venv}"
+export UV_PROJECT_ENVIRONMENT
+
+if command -v uv >/dev/null 2>&1; then
   PORT_CHECK_CMD="uv run python"
   set -- uv run streamlit
+elif [ -x "$UV_PROJECT_ENVIRONMENT/bin/python" ]; then
+  PORT_CHECK_CMD="$UV_PROJECT_ENVIRONMENT/bin/python"
+  set -- "$UV_PROJECT_ENVIRONMENT/bin/python" -m streamlit
+elif [ -x "$CURRENT_DIR/.venv/bin/python" ]; then
+  PORT_CHECK_CMD="$CURRENT_DIR/.venv/bin/python"
+  set -- "$CURRENT_DIR/.venv/bin/python" -m streamlit
 elif command -v streamlit >/dev/null 2>&1; then
   echo "***** Warning: using streamlit from PATH. If dependencies fail, run 'uv sync --frozen' first. *****"
   PORT_CHECK_CMD="python3"
