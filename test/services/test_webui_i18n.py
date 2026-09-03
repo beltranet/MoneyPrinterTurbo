@@ -13,13 +13,13 @@ WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
 I18N_DIR = ROOT_DIR / "webui" / "i18n"
 LLM_PROVIDER_TIPS_PREFIX = "llm_provider_tips."
 TTS_PROVIDER_TIPS_PREFIX = "tts_provider_tips."
-SECONDARY_LOCALES = ("de", "es", "id", "pt", "ru", "tr", "vi")
+SECONDARY_LOCALES = ("de", "es", "fr", "id", "it", "ko", "pt", "ru", "tr", "vi")
 PROVIDER_TIPS_PREFIXES = (
     LLM_PROVIDER_TIPS_PREFIX,
     TTS_PROVIDER_TIPS_PREFIX,
 )
-# Shengsuan Cloud 目前只提供中英文界面。次要语言统一回退英文，避免在七个
-# locale 中复制同一份英文后长期不同步；其它普通界面文案仍必须完整翻译。
+# 合作 Provider 的品牌名和长说明只维护中英文。次要 locale 统一回退英文，
+# 避免把完全相同的品牌名复制十份，也避免长说明后续只更新部分语言。
 ENGLISH_FALLBACK_KEYS = frozenset(
     {
         "AI Video Quote Required",
@@ -38,12 +38,30 @@ ENGLISH_FALLBACK_KEYS = frozenset(
         "llm_provider_endpoint.moonshot.global",
         "llm_provider_authentication_error.moonshot",
         "Local LLM Script Generation",
+        "llm_provider_label.apimart",
+        "llm_provider_label.openrouter",
         "llm_provider_label.shengsuanyun",
         "LoomLoom Poll Retry Pending",
         "LoomLoom Poll Retry Warning",
         "Resume LoomLoom Status Check",
         "LoomLoom Quote Summary Singular",
         "LoomLoom Video Terms Reuse Help",
+        "Metaso MiniMax H3",
+        "Metaso MiniMax H3 Help",
+        "Metaso MiniMax API Key",
+        "Metaso MiniMax API Key Help",
+        "Metaso MiniMax Base URL",
+        "Metaso MiniMax Resolution",
+        "Metaso MiniMax Resolution Help",
+        "Metaso MiniMax Invalid Resolution",
+        "Select Metaso MiniMax Resolution",
+        "Please Enter the Metaso MiniMax API Key",
+        "Metaso MiniMax Billing Notice",
+        "Metaso MiniMax Billing Notice Uploaded Audio",
+        "Metaso MiniMax Billing Notice Without Script",
+        "Confirm Metaso MiniMax Charge",
+        "Confirm Metaso MiniMax Charge Help",
+        "Confirm Metaso MiniMax Charge Required",
         "Script Generation Method",
         "Script Generation Method Help",
         "Shengsuan Cloud AI Video",
@@ -158,6 +176,15 @@ class TestWebuiI18n(unittest.TestCase):
                     default_model=provider.default_model,
                 )
                 self.assertEqual(_markdown_urls(rendered), expected_urls)
+
+    def test_metaso_api_key_label_keeps_mpt_referral_link(self):
+        """秘塔 Key 获取入口必须保留 MPT 追踪参数，避免赞助转化链路失效。"""
+        expected_url = "https://metaso.cn/minimax-h3/?s=MPT"
+
+        for locale in ("zh", "en"):
+            with self.subTest(locale=locale):
+                label = _load_translation(locale)["Metaso MiniMax API Key"]
+                self.assertEqual(_markdown_urls(label), {expected_url})
 
     def test_secondary_locales_cover_english_locale(self):
         en_translations = _load_translation("en")
