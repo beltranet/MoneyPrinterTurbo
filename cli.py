@@ -140,6 +140,8 @@ _TRANSITION_MODE_VALUES = {
     "fade-out": "FadeOut",
     "slide-in": "SlideIn",
     "slide-out": "SlideOut",
+    "zoom-in": "ZoomIn",
+    "zoom-out": "ZoomOut",
 }
 
 
