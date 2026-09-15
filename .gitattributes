@@ -1,5 +1,5 @@
-# Auto detect text files and normalize line endings in the repository
 * text=auto
+*.sh text eol=lf
 
 # Binary assets
 *.mp3 binary
