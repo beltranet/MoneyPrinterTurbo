@@ -15,4 +15,4 @@ echo " Host: $MPT_WEBUI_HOST | Port: $MPT_WEBUI_PORT"
 echo " Environment: $UV_PROJECT_ENVIRONMENT"
 echo "========================================================"
 
-exec ./webui.sh
+exec sh ./webui.sh
