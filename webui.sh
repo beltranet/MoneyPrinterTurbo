@@ -19,19 +19,19 @@ MPT_WEBUI_PORT="${MPT_WEBUI_PORT:-8501}"
 UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$HOME/.local/share/MoneyPrinterTurbo/.venv}"
 export UV_PROJECT_ENVIRONMENT
 
-if command -v uv >/dev/null 2>&1; then
-  PORT_CHECK_CMD="uv run python"
-  set -- uv run streamlit
-elif [ -x "$UV_PROJECT_ENVIRONMENT/bin/python" ]; then
-  PORT_CHECK_CMD="$UV_PROJECT_ENVIRONMENT/bin/python"
-  set -- "$UV_PROJECT_ENVIRONMENT/bin/python" -m streamlit
-elif [ -x "$CURRENT_DIR/.venv/bin/python" ]; then
-  PORT_CHECK_CMD="$CURRENT_DIR/.venv/bin/python"
+if [ -x "$CURRENT_DIR/.venv/bin/python" ]; then
   set -- "$CURRENT_DIR/.venv/bin/python" -m streamlit
+  find_port() { find_available_port "$CURRENT_DIR/.venv/bin/python"; }
+elif [ -x "$UV_PROJECT_ENVIRONMENT/bin/python" ]; then
+  set -- "$UV_PROJECT_ENVIRONMENT/bin/python" -m streamlit
+  find_port() { find_available_port "$UV_PROJECT_ENVIRONMENT/bin/python"; }
+elif command -v uv >/dev/null 2>&1; then
+  set -- uv run streamlit
+  find_port() { find_available_port uv run python; }
 elif command -v streamlit >/dev/null 2>&1; then
   echo "***** Warning: using streamlit from PATH. If dependencies fail, run 'uv sync --frozen' first. *****"
-  PORT_CHECK_CMD="python3"
   set -- streamlit
+  find_port() { find_available_port python3; }
 else
   echo "***** Neither project Python, uv, nor streamlit was found. Please install dependencies first. *****"
   exit 1
@@ -61,8 +61,7 @@ PY
 }
 
 # 用 Python 做端口探测，避免依赖 lsof/nc 在不同 macOS/Linux 发行版上的差异。
-# shellcheck disable=SC2086
-SELECTED_WEBUI_PORT=$(find_available_port $PORT_CHECK_CMD)
+SELECTED_WEBUI_PORT=$(find_port)
 
 if [ -z "$SELECTED_WEBUI_PORT" ]; then
   echo "***** No available WebUI port found in 8501-8599 for $MPT_WEBUI_HOST. *****"

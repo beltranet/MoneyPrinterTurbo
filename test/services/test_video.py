@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import redirect_stdout
@@ -62,6 +63,60 @@ class TestVideoService(unittest.TestCase):
         config.app.update(self.original_app_config)
         vd._runtime_disabled_video_codecs.clear()
         vd._ffmpeg_encoder_exists.cache_clear()
+
+    def test_subtitle_spring_animation_keeps_color_and_mask_aligned(self):
+        """
+        弹跳动画必须同步缩放颜色帧和透明蒙版。
+
+        旧实现只缩放颜色帧，首帧仍使用原尺寸蒙版，合成后会短暂出现黑色
+        文字轮廓。使用纯白画面和完整蒙版可以精确比较二者的有效像素区域。
+        """
+        color_frame = vd.np.full((20, 30, 3), 255, dtype=vd.np.uint8)
+        mask_frame = vd.np.ones((20, 30), dtype=float)
+        clip = (
+            ImageClip(color_frame)
+            .with_mask(ImageClip(mask_frame, is_mask=True))
+            .with_duration(1)
+        )
+        animated = vd._apply_subtitle_spring_animation(clip, 1)
+
+        try:
+            initial_color = vd.np.any(animated.get_frame(0) > 0, axis=2)
+            initial_mask = animated.mask.get_frame(0) > 0
+            vd.np.testing.assert_array_equal(initial_color, initial_mask)
+            self.assertLess(initial_color.sum(), color_frame.shape[0] * color_frame.shape[1])
+
+            # 动画结束后必须精确恢复原始尺寸，避免长字幕持续模糊或缩放。
+            settled_color = animated.get_frame(
+                vd._SUBTITLE_SPRING_DURATION_SECONDS
+            )
+            settled_mask = animated.mask.get_frame(
+                vd._SUBTITLE_SPRING_DURATION_SECONDS
+            )
+            vd.np.testing.assert_array_equal(settled_color, color_frame)
+            vd.np.testing.assert_array_equal(settled_mask, mask_frame)
+        finally:
+            vd.close_clip(animated)
+            vd.close_clip(clip)
+
+    def test_subtitle_spring_scale_handles_time_boundaries(self):
+        """零时长、负时间和动画结束点都不能产生除零或非法缩放比例。"""
+        duration = vd._SUBTITLE_SPRING_DURATION_SECONDS
+
+        self.assertEqual(vd._get_subtitle_spring_scale(0, duration), 0.05)
+        self.assertEqual(vd._get_subtitle_spring_scale(-1, duration), 0.05)
+        self.assertEqual(vd._get_subtitle_spring_scale(duration, duration), 1.0)
+        self.assertEqual(vd._get_subtitle_spring_scale(1, 0), 1.0)
+
+    def test_scale_subtitle_frame_rejects_unsupported_shapes(self):
+        """异常通道或维度应明确失败，避免把损坏帧继续交给视频编码器。"""
+        with self.assertRaisesRegex(ValueError, "2D mask or 3D color"):
+            vd._scale_subtitle_frame_on_canvas(vd.np.zeros((8,)), 0.5)
+        with self.assertRaisesRegex(ValueError, "RGB or RGBA"):
+            vd._scale_subtitle_frame_on_canvas(
+                vd.np.zeros((8, 8, 2), dtype=vd.np.uint8),
+                0.5,
+            )
 
     def test_fit_clip_cover_fills_portrait_canvas_without_black_bars(self):
         source_color = [17, 34, 51]
@@ -929,6 +984,59 @@ class TestVideoService(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("-t") + 1], "10.000")
         self.assertLess(command.index("-t"), command.index(output_file))
+
+    def test_concat_video_clips_logs_heartbeat_while_ffmpeg_runs(self):
+        """
+        拼接时 subprocess.run 会阻塞到 ffmpeg 退出，期间项目不再产生任何日志，用户
+        无法区分仍在编码与已经卡死（issue #1342）。等待期间必须记录存活信息。
+        """
+
+        def slow_run(command, capture_output, text, check):
+            # 模拟一次耗时拼接：这段窗口内心跳线程应至少记录一次存活日志。
+            time.sleep(0.2)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+            Path(output_file).write_bytes(b"x" * 2048)
+
+            with patch.object(vd, "_FFMPEG_CONCAT_HEARTBEAT_SECONDS", 0.02):
+                with patch.object(vd.subprocess, "run", side_effect=slow_run):
+                    with patch.object(vd.logger, "info") as info_mock:
+                        vd.concat_video_clips_with_ffmpeg(
+                            clip_files=[clip_file],
+                            output_file=output_file,
+                            threads=1,
+                            output_dir=temp_dir,
+                        )
+
+        heartbeats = [
+            str(call.args[0])
+            for call in info_mock.call_args_list
+            if "still running" in str(call.args[0])
+        ]
+        self.assertTrue(heartbeats, "耗时拼接期间必须记录存活日志")
+        self.assertRegex(heartbeats[0], r"elapsed=\d+s, output size: 0\.00 MB")
+
+    def test_concat_video_clips_heartbeat_tolerates_missing_output_file(self):
+        """
+        拼接刚开始时输出文件尚未创建，心跳描述必须安全降级；若探测文件大小的异常
+        穿透到拼接调用，本可正常完成的任务会变成失败。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertIn(
+                "not available",
+                vd._describe_concat_output_progress(
+                    os.path.join(temp_dir, "absent.mp4")
+                ),
+            )
+            existing = os.path.join(temp_dir, "present.mp4")
+            Path(existing).write_bytes(b"x" * 2048)
+            self.assertIn(
+                "output size: 0.00 MB", vd._describe_concat_output_progress(existing)
+            )
 
     def test_prioritize_unique_source_clips_uses_each_source_before_reuse(self):
         """
