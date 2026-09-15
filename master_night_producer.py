@@ -18,9 +18,40 @@ import json
 import base64
 import requests
 import subprocess
+import imageio_ffmpeg
 from pathlib import Path
+from typing import TypedDict, Any, List, Tuple
 from loguru import logger
 from PIL import Image, ImageDraw, ImageFont
+
+import infographic_generator
+import motion_engine
+from app.services import voice, subtitle
+
+
+class Episode(TypedDict):
+    num: str
+    base_name: str
+    badge_es: str
+    badge_en: str
+    title_es: str
+    title_en: str
+    sub_es: str
+    sub_en: str
+    color: Tuple[int, int, int]
+    cover_bg: str
+    materials: List[Any]
+    script_es: str
+    script_en: str
+    desc_es: str
+    desc_en: str
+    tags_es: str
+    tags_en: str
+    hashtags_es: str
+    hashtags_en: str
+    copy_ig_es: str
+    copy_ig_en: str
+
 
 # Directorios de Trabajo
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -197,7 +228,7 @@ def generate_social_covers(title: str, subtitle: str, badge: str, theme_color: t
     combined.convert("RGB").save(out_file, quality=95)
     logger.info(f"Portada generada: {out_file.name}")
 
-def generate_social_metadata(ep: dict, base_name: str):
+def generate_social_metadata(ep: Episode, base_name: str):
     md_content = f"""# KIT DE PUBLICACIÓN Y METADATOS: {ep['num']} - {ep['title_es']}
 ## SERIE FUNDACIONAL ZHINENG QIGONG (30 VIDEOS)
 
@@ -282,8 +313,27 @@ def generate_social_metadata(ep: dict, base_name: str):
         f.write(md_content)
     logger.info(f"Metadatos sociales guardados: {out_md.name}")
 
-def produce_single_video(video_subject: str, script_text: str, voice_name: str, materials: list, out_path: Path, replacements: dict):
-    if out_path.exists() and out_path.stat().st_size > 1000000:
+def burn_subtitles_and_audio_ffmpeg(source_video: str, audio_file: str, subtitle_path: str, output_path: str, font_size=24, font_color="&H00FFFFFF", outline_color="&H00000000", outline_width=3, bottom_margin=300):
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    srt_escaped = str(Path(subtitle_path).resolve()).replace(":", r"\:").replace("\\", "/")
+    style = f"FontSize={font_size},PrimaryColour={font_color},OutlineColour={outline_color},Outline={outline_width},MarginV={bottom_margin},Alignment=2"
+    vf_filter = f"subtitles='{srt_escaped}':force_style='{style}'"
+    cmd = [
+        ffmpeg_exe, "-y",
+        "-i", source_video,
+        "-i", audio_file,
+        "-vf", vf_filter,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        output_path
+    ]
+    subprocess.run(cmd, check=True)
+
+def produce_single_video(ep: Episode, lang: str, voice_name: str, out_path: Path, replacements: dict, force_rebuild: bool = True):
+    if out_path.exists() and out_path.stat().st_size > 1000000 and not force_rebuild:
         logger.info(f"Video ya existe: {out_path.name}")
         return
 
@@ -291,10 +341,12 @@ def produce_single_video(video_subject: str, script_text: str, voice_name: str, 
     task_dir = STORAGE_DIR / "tasks" / temp_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
+    script_text = ep["script_es"] if lang == "ES" else ep["script_en"]
+
     audio_file = str(task_dir / "tts_voice.mp3")
     subtitle_file = str(task_dir / "subtitles.srt")
 
-    logger.info(f"Sintetizando voz: {voice_name}...")
+    logger.info(f"Sintetizando voz ({len(script_text.split())} palabras): {voice_name}...")
     voice.tts(text=script_text, voice_name=voice_name, voice_rate=1.0, voice_file=audio_file)
     logger.info("Transcribiendo subtítulos...")
     subtitle.create(audio_file=audio_file, subtitle_file=subtitle_file)
@@ -302,32 +354,41 @@ def produce_single_video(video_subject: str, script_text: str, voice_name: str, 
     logger.info("Aplicando ortografía estricta a subtítulos...")
     apply_subtitles_clean(subtitle_file, replacements)
 
-    logger.info(f"Ensamblando video {out_path.name}...")
-    final_video = video.combine_videos(
-        combined_video_path=str(out_path),
-        video_paths=materials,
-        audio_file=audio_file,
-        video_aspect=video.VideoAspect.portrait,
-        max_clip_duration=7,
-        threads=8
+    # 1. Cargar imágenes dedicadas del banco NotebookLM (ES o EN)
+    nb_dir = STORAGE_DIR / "banco_imagenes_notebooklm"
+    nb_clips = sorted([str(p) for p in nb_dir.glob(f"ep{ep['num']}_*_{lang}.png")])
+    if not nb_clips:
+        infographic_img = infographic_generator.generate_infographic_slide(ep, lang=lang)
+        infographic_path = str(task_dir / "notebooklm_infographic.png")
+        infographic_img.save(infographic_path)
+        nb_clips = [infographic_path]
+
+    materials_all = nb_clips + ep["materials"]
+
+    logger.info(f"Ensamblando video dinámico (Ken Burns + Crossfades) para {out_path.name}...")
+    temp_raw_video = str(task_dir / "raw_concat.mp4")
+    
+    motion_engine.build_dynamic_video(
+        scene_items=materials_all,
+        audio_path=audio_file,
+        output_path=temp_raw_video
     )
 
-    if final_video and os.path.exists(final_video):
-        logger.info(f"Incrustando subtítulos en {out_path.name}...")
-        video_with_subs = str(out_path).replace(".mp4", "_subbed.mp4")
-        video.add_subtitles(
-            source_path=final_video,
-            subtitles_path=subtitle_file,
-            output_path=video_with_subs,
-            font_size=18,
+    if os.path.exists(temp_raw_video):
+        logger.info(f"Multiplexando audio e incrustando subtítulos en {out_path.name}...")
+        burn_subtitles_and_audio_ffmpeg(
+            source_video=temp_raw_video,
+            audio_file=audio_file,
+            subtitle_path=subtitle_file,
+            output_path=str(out_path),
+            font_size=24,
             font_color="&H00FFFFFF",
             outline_color="&H00000000",
-            outline_width=2,
-            bottom_margin=380
+            outline_width=3,
+            bottom_margin=300
         )
-        if os.path.exists(video_with_subs):
-            os.replace(video_with_subs, out_path)
-            logger.success(f"Video finalizado con éxito: {out_path.name}")
+        logger.success(f"Video finalizado con éxito: {out_path.name}")
+
 
 def main():
     logger.info("===================================================================")
@@ -375,7 +436,7 @@ def main():
         curated_clips["ep01_01"] = ensure_image_clip(str(ep01_extra), duration=8)
 
     # 5. MATRIZ MAESTRA: LOS 15 EPISODIOS FUNDACIONALES
-    episodes = [
+    episodes: List[Episode] = [
         # EPISODIO 01
         {
             "num": "01",
@@ -390,18 +451,22 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep01_que_es_el_qi_01.jpg"),
             "materials": [sd_nebula, p_clip1, curated_clips.get("ep01_res1", sd_cell), curated_clips.get("ep01_res2", p_clip3), sd_meridian],
             "script_es": (
-                "¿Qué es realmente el Chi? Lejos de leyendas o misticismo, en Chineng Chikung entendemos el Chi "
-                "como la sustancia y energía fundamental que sostiene todo en el universo. Es la fuerza viva que nutre "
-                "tus células, regula tu sistema nervioso y recarga tu vitalidad diaria. Cuando el Chi es abundante "
-                "y fluye sin obstáculos, el cuerpo activa su capacidad natural de autorregulación y la mente encuentra "
-                "profunda serenidad. Cultivar tu Chi no es fantasía, es ciencia y entrenamiento diario."
+                "¿Qué es realmente el Chi y cómo puede transformar tu salud diaria? Lejos de conceptos místicos o leyendas antiguas, "
+                "en Chineng Chikung entendemos el Chi como la sustancia y energía fundamental que constituye y sostiene todo en el universo. "
+                "Es la fuerza vital que nutre cada una de tus células, regula el sistema nervioso y recarga tu reserva biológica de vitalidad. "
+                "Cuando el Chi dentro de tu cuerpo es abundante y fluye libremente sin bloqueos, tu organismo activa de forma inmediata su capacidad natural de autorregulación y regeneración. "
+                "Sin embargo, el estrés constante y la dispersión mental agotan esta valiosa energía. Al aprender a cultivar y concentrar tu Chi mediante la intención enfocada y el movimiento consciente, "
+                "recuperas tu equilibrio físico, emocional y mental. Practicar Chineng Chikung no es una creencia, es un entrenamiento científico diario para transformar tu vida. "
+                "Comienza hoy a reconectar con tu verdadera fuente de energía."
             ),
             "script_en": (
-                "What is Qi really? Beyond mysticism or fantasy, in ZhiNeng QiGong we understand Qi as the fundamental "
-                "substance and vital energy that sustains everything in the universe. It is the living force nourishing your cells, "
-                "regulating your nervous system, and restoring your daily vitality. When Qi is abundant and flows freely, the body "
-                "activates its natural self-healing capacity while the mind attains profound serenity. Cultivating your Qi is not magic; "
-                "it is daily scientific practice."
+                "What is Qi really, and how does it transform your daily health? Far from mystical legends, in ZhiNeng QiGong we understand Qi "
+                "as the fundamental substance and vital energy that sustains all life in the universe. It is the living force nourishing your cells, "
+                "regulating your nervous system, and restoring your body's energy reserves. When Qi is abundant and flows freely through your meridians, "
+                "your body instantly activates its natural self-healing and regenerative capacity. Unfortunately, chronic stress and mental distraction drain this precious energy. "
+                "By learning to cultivate and gather Qi through focused intention and conscious movement, you restore your physical, emotional, and mental balance. "
+                "Practicing ZhiNeng QiGong is not about belief; it is a daily scientific system to optimize your vitality and peace of mind. "
+                "Start reconnecting with your inner energy today and cultivate a healthier life."
             ),
             "desc_es": "Descubre qué es el Qì (气) desde la perspectiva científica del ZhiNeng QiGong y cómo transforma tu salud y vitalidad.",
             "desc_en": "Discover what Qi (气) truly is from the scientific lens of ZhiNeng QiGong and how it restores natural vitality.",
@@ -426,17 +491,22 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep02_que_es_zhineng_qigong_res1.jpg"),
             "materials": [curated_clips.get("ep02_res1", sd_mind), p_clip2, curated_clips.get("ep02_res2", sd_meridian), p_clip4, sd_cell],
             "script_es": (
-                "¿Qué hace diferente a Chineng Chikung de otras disciplinas? Creado por el Doctor Pang Ming, médico "
-                "occidental y tradicional, es un sistema científico de desarrollo de la conciencia y salud integral. "
-                "No consiste en simples movimientos físicos, sino en la unión armónica entre mente, cuerpo y Chi. "
-                "A través de métodos precisos, entrenamos a la mente para guiar la energía a donde el cuerpo más lo necesita. "
-                "Es el arte de convertirte en el arquitecto consciente de tu propia salud."
+                "¿Qué hace verdaderamente único a Chineng Chikung en comparación con otras disciplinas? Creado por el Doctor Pang Ming, médico "
+                "occidental y de medicina tradicional china, es un sistema científico enfocado en el desarrollo de la conciencia y la salud integral. "
+                "No se trata de simples ejercicios físicos o estiramientos, sino de la integración armónica entre la mente, el cuerpo y el Chi. "
+                "El aspecto central de este método es que utilizas tu propia mente consciente para dirigir el flujo de energía hacia donde tu cuerpo más lo necesita. "
+                "Al practicar de forma constante, no solo fortaleces tus músculos y articulaciones, sino que transformas patrones emocionales profundos y elevas tu calidad de vida. "
+                "Chineng Chikung te brinda herramientas prácticas para ser el propio arquitecto de tu salud y serenidad. "
+                "Descubre el poder de cultivar tu energía interna todos los días."
             ),
             "script_en": (
-                "What makes ZhiNeng QiGong unique? Founded by Dr. Pang Ming, a master of both Western and Traditional Chinese Medicine, "
-                "it is a scientific methodology of consciousness development and holistic health. It is not merely physical movement, "
-                "but the harmonious integration of mind, body, and Qi. Through precise practice, we train the mind to guide energy "
-                "where the body needs it most, empowering you to become the conscious creator of your own health."
+                "What makes ZhiNeng QiGong unique compared to other mind-body practices? Created by Dr. Pang Ming, a doctor trained in both Western "
+                "and Traditional Chinese Medicine, it is a scientific system designed to develop human consciousness and holistic health. "
+                "It goes far beyond simple physical movement; it is a harmonious integration of mind, body, and energy. "
+                "The central principle of this method is using your conscious mind to direct the flow of Qi precisely where your body needs healing. "
+                "Through consistent practice, you not only strengthen your muscles and joints, but also transform deep emotional patterns and elevate your quality of life. "
+                "ZhiNeng QiGong provides practical tools to become the architect of your own health and inner serenity. "
+                "Discover the power of cultivating your internal energy every single day."
             ),
             "desc_es": "¿Qué es el ZhiNeng QiGong y quién es el Dr. Pang Ming? Conoce el sistema científico de medicina energética más riguroso.",
             "desc_en": "What is ZhiNeng QiGong and who is Dr. Pang Ming? Learn the most rigorous medical energy science created in modern times.",
@@ -461,17 +531,22 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep03_el_campo_de_qi_res1.jpg"),
             "materials": [curated_clips.get("ep03_res1", sd_nebula), p_clip3, curated_clips.get("ep03_res2", sd_meridian), p_clip5, sd_mind],
             "script_es": (
-                "¿Has sentido alguna vez la fuerza multiplicada de meditar o entrenar en grupo? En Chineng Chikung "
-                "esto se conoce como Chi Chang, o el Campo de Chi. Es un espacio cuántico donde la intención, el corazón "
-                "y la energía de muchas personas se sincronizan para crear una resonancia colectiva de sanación. "
-                "Al conectarte al campo, tu práctica se profundiza diez veces más que al practicar solo. "
-                "En el campo de Chi, la salud de uno es el impulso y la fuerza de todos."
+                "¿Sabías que existe una red invisible de energía que conecta a todas las personas? En Chineng Chikung lo llamamos el Campo de Chi. "
+                "Un Campo de Chi es la acumulación de información, intención armónica y energía vital organizada por practicantes que se enfocan en un mismo propósito de salud y paz. "
+                "Al organizar un Campo de Chi antes de practicar o meditar, la energía del lugar se potencia exponencialmente, facilitando la sanación y la serenidad de todos los presentes. "
+                "Incluso a la distancia, la mente puede conectarse a este campo colectivo para recibir apoyo energético y vitalidad. "
+                "Este principio demuestra que no estamos aislados, sino interconectados en una vasta red de vida. "
+                "Aprender a organizar y sintonizarte con el Campo de Chi transforma tu entorno y fortalece tu práctica diaria. "
+                "Únete al campo armónico y siente la fuerza del colectivo."
             ),
             "script_en": (
-                "Have you ever experienced the multiplied strength of meditating in a group? In ZhiNeng QiGong, "
-                "this is known as the Qi Chang, or the Qi Field. It is a space where the focused intention and energy of many individuals "
-                "synchronize to form a powerful collective resonance of healing. When you connect to the Qi Field, your practice deepens "
-                "tenfold compared to practicing alone. Within the field, individual wellness uplifts everyone."
+                "Did you know there is an invisible energy network connecting all living beings? In ZhiNeng QiGong, we call this the Qi Field. "
+                "A Qi Field is an accumulation of information, harmonious intent, and vital energy organized by practitioners focusing on a shared purpose of health and peace. "
+                "By organizing a Qi Field before practicing or meditating, the room's energy becomes exponentially amplified, facilitating healing and deep calm for everyone present. "
+                "Even across great distances, your mind can connect to this collective field to receive energetic support and vitality. "
+                "This principle proves that we are never isolated, but interconnected in a vast web of life. "
+                "Learning to organize and attune yourself to the Qi Field elevates your environment and empowers your daily practice. "
+                "Connect with the harmonious field today and experience collective strength."
             ),
             "desc_es": "El Campo de Qì (Qì Chǎng): Cómo la intención colectiva multiplica los resultados de tu práctica y sanación.",
             "desc_en": "The Qi Field (Qi Chang): How collective synchronized intention accelerates personal healing and inner peace.",
@@ -496,17 +571,20 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep04_el_qi_primordial_res1.jpg"),
             "materials": [sd_nebula, curated_clips.get("ep04_res1", p_clip4), curated_clips.get("ep04_res2", sd_cell), p_clip1, sd_meridian],
             "script_es": (
-                "Todo en el universo proviene de una sola fuente inagotable: el Hunyuan Chi. "
-                "En la teoría de Chineng Chikung, el Hunyuan Chi es la sustancia primordial informe de donde nacen la materia, "
-                "la energía y la información. A diferencia de otros sistemas de energía, el Hunyuan Chi no tiene límites ni desgaste. "
-                "Al practicar Chineng Chikung, no gastas tu propia energía vital, sino que te conectas directamente "
-                "con la abundancia infinita de la naturaleza. Aprende a nutrir tu vida desde la fuente pura."
+                "El Hunyuan Chi es el concepto central de la teoría de Chineng Chikung. Representa la forma más pura, primordial e indiferenciada de energía en el universo, "
+                "nacida de la combinación de la materia, la energía y la información. A diferencia de formas especializadas de energía, el Hunyuan Chi contiene todas las potencialidades de la naturaleza "
+                "y puede transformarse en cualquier elemento que tu cuerpo requiera para sanar. Cuando realizas los movimientos de Chineng Chikung, abres los poros del cuerpo e intercambias tu Chi interno "
+                "con el Hunyuan Chi del cosmos. Este intercambio continuo disuelve bloqueos, elimina toxinas y regenera los tejidos a nivel celular. "
+                "Tu cuerpo aprende a reponer energía vital ilimitada directamente del entorno. Al comprender y cultivar el Hunyuan Chi, abres la puerta a una vitalidad inagotable "
+                "y a un estado de salud óptimo."
             ),
             "script_en": (
-                "Everything in the cosmos originates from a single inexhaustible source: Hunyuan Qi. In ZhiNeng QiGong theory, "
-                "Hunyuan Qi is the formless primordial substance giving rise to matter, energy, and information. Unlike systems that drain "
-                "your personal energy reserves, ZhiNeng QiGong connects you directly to nature's limitless abundance. "
-                "You do not deplete yourself; you recharge directly from the universal source."
+                "Hunyuan Qi is the core theoretical concept behind ZhiNeng QiGong. It represents the purest, primordial, and undifferentiated form of energy in the universe, "
+                "arising from the merging of matter, energy, and information. Unlike specialized forms of energy, Hunyuan Qi contains all natural potential and can transform into whatever "
+                "your body needs for healing. When you practice ZhiNeng QiGong movements, you open every pore of your body and exchange internal Qi with the cosmic Hunyuan Qi around you. "
+                "This continuous exchange dissolves energetic blockages, removes toxins, and rejuvenates tissues at the cellular level. "
+                "Your body learns to replenish unlimited vital energy directly from the environment. By understanding and cultivating Hunyuan Qi, you unlock the door to boundlessness, "
+                "vitality, and optimal well-being."
             ),
             "desc_es": "La Teoría del Hùnyuán Qì: La fuente inagotable de energía primordial que nutre todo lo vivo.",
             "desc_en": "The Theory of Hunyuan Qi: The infinite reservoir of primordial energy that nourishes all existence.",
@@ -531,17 +609,20 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep05_las_tres_capas_res1.jpg"),
             "materials": [curated_clips.get("ep05_res1", sd_cell), p_clip2, curated_clips.get("ep05_res2", sd_mind), p_clip6, sd_nebula],
             "script_es": (
-                "¿Sabías que la materia es solo la capa más superficial de la realidad? El Doctor Pang Ming explicó que todo "
-                "existe en tres capas: materia, energía e información. La medicina convencional trabaja principalmente en la materia. "
-                "Chineng Chikung opera desde la capa de la información. Cuando transformas la información en tu mente y tu campo, "
-                "el Chi se reorganiza de inmediato y la materia en tus células se regenera naturalmente. "
-                "Cambia tu información y transformarás tu biología."
+                "La ciencia moderna y el Chineng Chikung coinciden en un descubrimiento fundamental: todo lo que existe en el universo se compone de tres capas interrelacionadas: masa, energía e información. "
+                "La masa es la estructura física visible, como tus órganos y tejidos. La energía es la fuerza viva que los pone en movimiento y les da dinamismo. "
+                "Pero la capa más profunda y determinante es la información, la cual dirige cómo la energía se organiza y cómo la masa se manifiesta. "
+                "Cuando tus pensamientos y emociones transmiten información de estrés, miedo o enfermedad, el cuerpo físico responde alterándose. "
+                "Por el contrario, al enviar información clara de salud, gratitud y armonía a través de tu práctica de Chineng Chikung, reorganizas tu estructura celular desde la raíz. "
+                "Cambiar la información en tu mente es la clave definitiva para transformar tu cuerpo físico."
             ),
             "script_en": (
-                "Did you know physical matter is merely the surface layer of reality? Dr. Pang Ming explained that everything "
-                "exists across three interconnected levels: Matter, Energy, and Information. While conventional medicine treats physical matter, "
-                "ZhiNeng QiGong works at the causal layer of information. When you transform the information within your consciousness, "
-                "Qi instantly reorganizes, and physical cells regenerate naturally. Shift your information, and you transform your biology."
+                "Modern science and ZhiNeng QiGong share a fundamental revelation: everything in the universe consists of three interconnected layers: mass, energy, and information. "
+                "Mass is the physical visible structure, like your organs and tissues. Energy is the dynamic force that animates them. "
+                "But the most profound and decisive layer is information, which dictates how energy organizes and how mass manifests. "
+                "When your thoughts and emotions transmit information of stress, fear, or illness, the physical body reflects that disharmony. "
+                "Conversely, by broadcasting clear information of health, gratitude, and balance through your ZhiNeng QiGong practice, you reorganize your cellular structure from its root. "
+                "Changing the information in your mind is the ultimate key to transforming your physical body."
             ),
             "desc_es": "Las Tres Capas de la Realidad: Cómo sanar el cuerpo físico transformando la información en la mente.",
             "desc_en": "The Three Layers of Reality: How shifting conscious information reorganizes energy and heals physical biology.",
@@ -566,16 +647,19 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep06_la_mente_guia_al_qi_res2.jpg"),
             "materials": [curated_clips.get("ep06_res2", sd_mind), p_clip3, curated_clips.get("ep06_res1", sd_meridian), p_clip7, sd_cell],
             "script_es": (
-                "A donde va tu atención, va tu energía. En Chineng Chikung este principio fundamental se llama Yinian: "
-                "la mente dirige al Chi. Si tu atención vive dispersa en el estrés y la preocupación constante, tu energía "
-                "vital se fuga y agota tus defensas. Pero cuando enfocas tu intención con serenidad y presencia dentro del cuerpo, "
-                "el Chi sigue a la mente y revitaliza cada tejido. Domina tu mente y tomarás las riendas de tu vitalidad."
+                "\"Donde va la mente, fluye el Chi y la masa se transforma\". Este es el principio fundamental que rige toda la práctica de Chineng Chikung. "
+                "La mente no es un observador pasivo, sino la herramienta directora de la energía vital. Cuando enfocas tu atención en una parte específica de tu cuerpo con intención clara y pacífica, "
+                "el Chi se acumula de inmediato en esa zona, estimulando la circulación sanguínea y la nutrición celular. "
+                "Si tu mente está distraída o dispersa, tu energía se disipa sin lograr resultados. Por eso, durante la práctica entrenamos la concentración enfocada y la presencia plena en el presente. "
+                "Aprender a dominar tu atención te permite guiar la energía para sanar dolencias, calmar el sistema nervioso y restaurar el equilibrio interior. "
+                "Tu mente posee el poder de moldear tu realidad biológica."
             ),
             "script_en": (
-                "Where your attention goes, energy flows. In ZhiNeng QiGong, this cornerstone axiom is known as Yi Dao Qi Dao: "
-                "the mind directs the Qi. When attention is scattered in chronic stress and anxious loops, life energy leaks away. "
-                "However, when you place calm, focused intention within the body, Qi immediately follows the mind, revitalizing "
-                "every cell and tissue. Master your mind, and you hold the steering wheel of your vitality."
+                "\"Where the mind goes, Qi flows, and matter changes.\" This is the foundational law governing all ZhiNeng QiGong practice. "
+                "Your mind is not a passive observer, but the guiding director of vital energy. When you focus your attention on a specific part of your body with clear, peaceful intent, "
+                "Qi instantly gathers in that area, accelerating circulation and cellular nutrition. If your mind is distracted or scattered, your energy dissipates without producing healing results. "
+                "Therefore, during practice we train focused concentration and absolute presence in the now. Learning to master your attention enables you to guide energy to resolve ailments, "
+                "soothe the nervous system, and restore inner harmony. Your mind possesses the extraordinary power to shape your biological reality."
             ),
             "desc_es": "Yì Dào Qì Dào: El principio milenario que demuestra cómo la mente dirige la energía hacia la salud.",
             "desc_en": "Yi Dao Qi Dao: The core principle demonstrating how conscious focus commands the flow of vital Qi.",
@@ -600,18 +684,20 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep07_el_hospital_sin_medicinas_res1.jpg"),
             "materials": [huaxia_campus, curated_clips.get("ep07_res1", sd_cell), huaxia_healing, curated_clips.get("ep07_res2", p_clip2), huaxia_scientific],
             "script_es": (
-                "¿Imaginas un hospital con miles de personas donde no se recetaba ni un solo fármaco? En China existió el Centro Huaxia, "
-                "el hospital sin medicinas fundado por el Doctor Pang Ming. Durante más de una década, cientos de miles de practicantes "
-                "demostraron que el cuerpo puede autorregularse mediante la práctica intensiva de Chineng Chikung y el campo de Chi. "
-                "Con una tasa de efectividad médica superior al noventa y cuatro por ciento en más de ciento ochenta padecimientos, "
-                "Huaxia demostró el potencial ilimitado de la conciencia humana."
+                "Durante los años noventa, en China funcionó el centro de sanación sin medicamentos más grande del mundo: el Centro Huaxia, fundado por el Doctor Pang Ming. "
+                "En este hospital revolucionario no se utilizaban fármacos ni cirugías; los pacientes, llamados estudiantes, aprendían a practicar Chineng Chikung e integrarse en campos colectivos de Chi. "
+                "Miles de personas con diagnósticos severos o crónicos recuperaron su salud combinando el entrenamiento diario, la actitud positiva y el apoyo de la energía grupal. "
+                "La ciencia médica documentó con ecografías y radiografías la rápida disminución de tumores y la regeneración de tejidos en cuestión de minutos o días. "
+                "El legado de Huaxia demostró científicamente que el potencial humano de autorregulación es real y accesible para todos. "
+                "Tu cuerpo tiene la capacidad innata de sanar cuando le brindas las condiciones y la energía adecuadas."
             ),
             "script_en": (
-                "Can you imagine a hospital caring for thousands of patients where not a single pharmaceutical drug was prescribed? "
-                "In China, the Huaxia Center stood as the world's largest medicineless hospital, founded by Dr. Pang Ming. "
-                "For over a decade, hundreds of thousands of practitioners proved that the body can self-regulate through intensive "
-                "ZhiNeng QiGong practice and collective Qi fields. Achieving over a ninety-four percent effectiveness rate across "
-                "more than one hundred eighty chronic conditions, Huaxia proved the boundless healing power of human consciousness."
+                "During the 1990s in China, the world's largest medicine-free hospital operated with extraordinary results: the Huaxia Center, founded by Dr. Pang Ming. "
+                "In this revolutionary facility, no pharmaceutical drugs or surgeries were used. Patients, referred to as students, learned to practice ZhiNeng QiGong and immerse themselves in collective Qi Fields. "
+                "Thousands of individuals with severe chronic conditions restored their health through daily practice, a positive mindset, and group energy support. "
+                "Medical researchers documented with ultrasounds and X-rays the rapid disappearance of tumors and tissue regeneration in matters of minutes or days. "
+                "The Huaxia legacy proved scientifically that human self-healing capacity is real and accessible to everyone. "
+                "Your body possesses the innate ability to recover when provided with the right energy and state of mind."
             ),
             "desc_es": "El Hospital Huaxia: El legendario centro sin medicamentos donde miles de personas sanaron con ZhiNeng QiGong.",
             "desc_en": "The Huaxia Medicineless Hospital: The legendary clinic where thousands restored health through ZhiNeng QiGong.",
@@ -636,16 +722,19 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep08_estudiante_vs_paciente_res1.jpg"),
             "materials": [huaxia_care, curated_clips.get("ep08_res1", sd_mind), huaxia_healing, curated_clips.get("ep08_res2", p_clip1), huaxia_campus],
             "script_es": (
-                "En el hospital de Huaxia estaba prohibido llamar a las personas pacientes; se les llamaba estudiantes. "
-                "¿Por qué esta distinción? Porque un paciente asume una actitud pasiva, esperando que alguien externo lo cure. "
-                "Un estudiante, en cambio, aprende una ciencia de vida para cultivar y restaurar su propia salud. "
-                "El verdadero cambio comienza cuando dejas de ser víctima de una condición y asumes el liderazgo de tu propia biología."
+                "En el Centro Huaxia no existía la palabra \"paciente\", todos eran tratados como \"estudiantes\". Este cambio de lenguaje representa una profunda transformación de paradigma en la salud. "
+                "Un paciente adopta un rol pasivo, esperando que un médico o una medicina externa resuelva su problema de salud. "
+                "En cambio, un estudiante toma un rol activo y responsable, aprendiendo las leyes del Chi y entrenando su mente diariamente para restaurar el equilibrio de su cuerpo. "
+                "Al dejar de identificarte con la enfermedad y asumir el papel de estudiante de la vida, recuperas tu poder personal y la confianza en tu biología. "
+                "La sanación no es algo que ocurre por casualidad, sino el resultado de un compromiso consciente con tu práctica y tu actitud mental. "
+                "Conviértete en estudiante de tu propio cuerpo y despierta tu capacidad de autocuración."
             ),
             "script_en": (
-                "At the Huaxia Center, people were never called patients; they were called students. Why this profound distinction? "
-                "Because a patient assumes a passive role, waiting for an external doctor to fix them. A student, on the other hand, "
-                "learns an art of living to cultivate, master, and restore their own vitality. True healing begins the moment you stop "
-                "viewing yourself as a passive victim and step up as the empowered student of your own body."
+                "At the Huaxia Center, the word \"patient\" was never used; everyone was called a \"student.\" This shift in language represents a profound paradigm shift in healthcare. "
+                "A patient assumes a passive role, waiting for an external doctor or drug to cure an illness. In contrast, a student takes an active, responsible role, "
+                "learning the laws of Qi and training the mind daily to restore balance. By ceasing to identify with disease and adopting the mindset of a student, "
+                "you reclaim your personal power and trust in your biology. Healing is not a random coincidence, but the natural outcome of a conscious commitment to practice and mental alignment. "
+                "Become a dedicated student of your own body and awaken your self-healing potential today."
             ),
             "desc_es": "Estudiante vs Paciente: La clave mental de Huaxia para recuperar la autonomía de tu salud.",
             "desc_en": "Student vs Patient: The mental shift taught at Huaxia to reclaim sovereignty over personal vitality.",
@@ -670,16 +759,18 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep09_evidencia_de_sanacion_res1.jpg"),
             "materials": [huaxia_scientific, curated_clips.get("ep09_res1", sd_cell), huaxia_healing, curated_clips.get("ep09_res2", p_clip5), huaxia_campus],
             "script_es": (
-                "En el libro Ciento un Milagros de Sanación Natural se documentan recuperaciones asombrosas en Huaxia: "
-                "desde tumores y artritis severa hasta parálisis. Médicos y científicos internacionales filmaron la disolución "
-                "de masas en tiempo real en pantallas de ultrasonido en menos de un minuto, mientras los practicantes sincronizaban el campo de Chi. "
-                "No fue magia ni milagro sobrenatural: fue la ciencia del Chi y la intención pura despertando la capacidad autorreguladora del cuerpo."
+                "En el libro Ciento un Milagros de Sanación Natural se documentan recuperaciones asombrosas en Huaxia: desde tumores y artritis severa hasta parálisis. "
+                "Médicos y científicos internacionales filmaron la disolución de masas en tiempo real en pantallas de ultrasonido en menos de un minuto, "
+                "mientras los practicantes sincronizaban el campo de Chi. No fue magia ni milagro sobrenatural: fue la ciencia del Chi y la intención pura despertando la capacidad autorreguladora del cuerpo. "
+                "Estos registros demuestran que cuando la mente se libera de bloqueos y se enfoca con claridad, las células físicas responden de forma instantánea. "
+                "Confía en el potencial científico de tu cuerpo."
             ),
             "script_en": (
-                "Documented in the clinical records of 101 Miracles of Natural Healing are astonishing recoveries at Huaxia: "
-                "from severe tumors to paralysis and chronic organ failure. International scientists and physicians filmed the dissolution "
-                "of solid masses in real time on ultrasound monitors in under one minute while practitioners focused the Qi Field. "
-                "It was not magic or superstition: it was the rigorous science of Qi awakening the body's innate self-healing genius."
+                "Documented in the clinical records of 101 Miracles of Natural Healing are astonishing recoveries at Huaxia: from severe tumors to paralysis and chronic organ failure. "
+                "International scientists and physicians filmed the dissolution of solid masses in real time on ultrasound monitors in under one minute "
+                "while practitioners focused the Qi Field. It was not magic or superstition: it was the rigorous science of Qi awakening the body's innate self-healing genius. "
+                "These records prove that when the mind is freed from limiting beliefs and focused with absolute clarity, physical cells respond instantly. "
+                "Trust the scientific potential of your own body."
             ),
             "desc_es": "101 Milagros de Sanación: Los estudios médicos y ultrasonidos en tiempo real documentados en Huaxia.",
             "desc_en": "101 Miracles of Natural Healing: Real-time ultrasound evidence and clinical breakthroughs from Huaxia.",
@@ -704,16 +795,20 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep10_peng_qi_guan_ding_fa_res1.jpg"),
             "materials": [curated_clips.get("ep10_res1", sd_meridian), p_clip1, curated_clips.get("ep10_res2", sd_cell), p_clip4, sd_nebula],
             "script_es": (
-                "Peng Chi Guan Ding Fa, o Levantar el Chi y Verterlo por la Cabeza, es el método fundamental del primer nivel "
-                "de Chineng Chikung. A través de movimientos fluidos y apertura mental, abrimos los poros y canales del cuerpo "
-                "para liberar el Chi turbio e integrar el Hunyuan Chi puro de la naturaleza. Es el método practicado por millones "
-                "para restaurar el sistema inmunológico y mantener una vitalidad desbordante todos los días."
+                "Peng Chi Guan Ding Fa, o \"Levantar y Verter el Chi\", es el método fundamental del primer nivel de Chineng Chikung. "
+                "Es una práctica accesible y profunda diseñada para intercambiar el Chi interno del cuerpo con el Hunyuan Chi ilimitado del universo. "
+                "A través de movimientos suaves y fluidos combinados con la apertura y cierre de la mente, abres los poros y meridianos energéticos, "
+                "liberando el Chi turbio o estancado y vertiendo Chi puro desde la coronilla hasta la planta de los pies. "
+                "Esta técnica limpia los órganos internos, fortalece el sistema inmunológico y armoniza todo el cuerpo energético. "
+                "Practicar Levantar y Verter el Chi durante quince minutos al día renueva tu vitalidad y llena tu vida de claridad."
             ),
             "script_en": (
-                "Peng Qi Guan Ding Fa, or Lift Qi Up and Pour Qi Down, is the cornerstone Level 1 method of ZhiNeng QiGong. "
-                "Through graceful, circular movements and expanded awareness, we open the body's pores and energy channels, releasing "
-                "turbid Qi while infusing pure universal Hunyuan Qi through the crown of the head. Millions practice this daily "
-                "to restore their immune system and sustain radiant health."
+                "Peng Qi Guan Ding Fa, or Lift Qi Up Pour Qi Down, is the foundational first-level practice of ZhiNeng QiGong. "
+                "It is a profound yet accessible method designed to exchange internal Qi with the unlimited cosmic Hunyuan Qi. "
+                "Through gentle, fluid movements synchronized with opening and closing the mind, you open your energy pores and meridians, "
+                "releasing stagnant energy and pouring fresh Qi from the crown of your head down to your feet. "
+                "This practice cleanses internal organs, boosts the immune system, and harmonizes your entire energy body. "
+                "Practicing Lift Qi Up Pour Qi Down for just fifteen minutes a day restores your vitality and fills your life with clarity."
             ),
             "desc_es": "Pěng Qì Guàn Dǐng Fǎ: Aprende el método esencial de nivel 1 para intercambiar Qì con el universo.",
             "desc_en": "Peng Qi Guan Ding Fa: Master the essential Level 1 practice to exchange Qi directly with nature.",
@@ -738,16 +833,18 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep11_dun_qiang_gong_res1.jpg"),
             "materials": [curated_clips.get("ep11_res1", sd_spine), p_clip2, curated_clips.get("ep11_res2", sd_meridian), p_clip6, sd_cell],
             "script_es": (
-                "Dun Qiang Gong, o las sentadillas frente a la pared, es conocido como el método atajo en Chineng Chikung. "
-                "Al deslizar el cuerpo frente a una pared vertical, se estira y flexibiliza toda la columna vertebral, relajando la cintura "
-                "y abriendo la puerta de Mingmen. Este método desbloquea rápidamente la energía en la espalda, fortalece los riñones "
-                "y revitaliza todo tu cuerpo en solo unos minutos al día."
+                "Dun Qiang Gong, conocido como las Sentadillas de Pared, es considerado el ejercicio maestro para flexibilizar la columna vertebral y desbloquear el flujo energético del cuerpo. "
+                "Al deslizarte suavemente frente a una pared manteniendo la postura correcta, estiras cada vértebra, fortaleces los riñones y estimulas el paso del Chi a través del canal central de la médula espinal. "
+                "Esta práctica no solo mejora la postura física y fortalece las piernas, sino que calma profundamente el sistema nervioso central y desbloquea tensiones acumuladas en la zona lumbar. "
+                "Aunque requiere constancia y paciencia, las Sentadillas de Pared son una de las herramientas más efectivas para rejuvenecer el cuerpo, incrementar la flexibilidad y potenciar la energía vital en poco tiempo. "
+                "Integra este gran ejercicio en tu rutina y transforma tu columna."
             ),
             "script_en": (
-                "Dun Qiang Gong, or Wall Squats, is revered as the ultimate shortcut method in ZhiNeng QiGong. "
-                "By smoothly squatting in front of a flat vertical wall, you flex and align every vertebra of the spine, relaxing the lumbar region "
-                "and opening the vital gate of Mingmen. This practice rapidly unlocks stagnant energy along the back, strengthens kidney vitality, "
-                "and supercharges your whole system in just minutes a day."
+                "Wall Squats (Dun Qiang Gong) is celebrated as the ultimate master practice for spine flexibility and unblocking energy flow throughout the body. "
+                "By gently sliding down facing a wall with correct alignment, you stretch every vertebra, strengthen your kidneys, and stimulate Qi flow through the central spinal canal. "
+                "This practice not only improves physical posture and leg strength, but deeply soothes the central nervous system and releases stored lumbar tension. "
+                "Although it requires patience and dedication, Wall Squats are one of the most effective tools to rejuvenate the body, increase flexibility, and boost vital energy rapidly. "
+                "Integrate this powerful practice into your daily routine and revitalize your spine."
             ),
             "desc_es": "Dùn Qiáng Gōng: Las sentadillas frente a la pared para desbloquear la columna y fortalecer la puerta de Mìngmén.",
             "desc_en": "Dun Qiang Gong: Wall Squats to realign the spine, open Mingmen, and boost core kidney energy.",
@@ -772,16 +869,20 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep12_el_estado_de_mingjue_res1.jpg"),
             "materials": [curated_clips.get("ep12_res1", sd_mind), p_clip3, curated_clips.get("ep12_res2", sd_nebula), p_clip7, sd_meridian],
             "script_es": (
-                "Mingjue es el estado donde la conciencia se reconoce y observa a sí misma con absoluta pureza y serenidad. "
-                "Al entrar en el estado de Mingjue, la mente trasciende el ruido mental, las emociones aflictivas y los apegos del ego, "
-                "convirtiéndose en un espejo cristalino. Desde este estado de conciencia pura, la sanación, la claridad interior "
-                "y la paz profunda ocurren de forma espontánea y sin esfuerzo."
+                "En los niveles avanzados de Chineng Chikung, alcanzamos el estado de Mingjue. Mingjue significa \"conciencia clara, pura y observadora de sí misma\". "
+                "En este estado, la mente deja de juzgar, reaccionar o engancharse con pensamientos del pasado o preocupaciones del futuro. "
+                "Simplemente observa con claridad transparente todo lo que ocurre internamente y externamente. "
+                "Cuando la mente se estabiliza en Mingjue, la frecuencia de las ondas cerebrales se ralentiza y el cuerpo entra en un estado de profunda coherencia energética. "
+                "En este nivel de silencio y claridad, la sanación ocurre de forma casi instantánea porque no hay interferencia del ego ni resistencia mental. "
+                "Cultivar Mingjue es el camino para despertar la verdadera sabiduría interior y experimentar la paz inquebrantable que habita en tu corazón."
             ),
             "script_en": (
-                "Mingjue is the profound state where consciousness awakens to observe itself with unconditional clarity and stillness. "
-                "Entering Mingjue allows the mind to transcend emotional turbulence, noisy mental chatter, and ego attachments, "
-                "becoming like a luminous crystal mirror. From this vantage point of pure consciousness, deep healing, wisdom, "
-                "and inner serenity unfold effortlessly."
+                "In advanced levels of ZhiNeng QiGong, we enter the state of Mingjue. Mingjue means \"pure, clear, self-observing consciousness.\" "
+                "In this state, the mind ceases to judge, react, or attach to past thoughts and future worries. "
+                "It simply observes with transparent clarity everything occurring internally and externally. "
+                "When your mind stabilizes in Mingjue, brainwave frequencies slow down and the body enters profound energetic coherence. "
+                "At this level of silence and stillness, healing occurs almost instantly because there is no ego interference or mental resistance. "
+                "Cultivating Mingjue is the path to awakening true inner wisdom and experiencing the unshakable peace dwelling within your heart."
             ),
             "desc_es": "Míngjué Gōngfu: Cómo alcanzar el estado de observador interno puro y trascender el estrés mental.",
             "desc_en": "Mingjue Gongfu: How to stabilize the pure internal observer and transcend daily mental stress.",
@@ -806,16 +907,20 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep13_los_8_versos_del_campo_res1.jpg"),
             "materials": [curated_clips.get("ep13_res1", sd_nebula), p_clip1, curated_clips.get("ep13_res2", sd_mind), p_clip5, sd_cell],
             "script_es": (
-                "La cabeza toca el cielo, los pies firmes en la tierra. El cuerpo se relaja y la mente se expande hacia el infinito. "
-                "Los ocho versos creados por el Doctor Pang Ming son la llave maestra para organizar el campo de Chi perfecto "
-                "antes de cualquier práctica. Al entonar o contemplar estos versos, la mente entra en calma total "
-                "y se funde en perfecta armonía con el cosmos. Es el puente sagrado entre el ser humano y el universo."
+                "Antes de iniciar cualquier práctica de Chineng Chikung, organizamos el estado mental utilizando los tradicionales Ocho Versos creados por el Doctor Pang Ming. "
+                "Estos ocho versos son una guía poética y científica para alinear la postura física, relajar el cuerpo y expandir la mente hacia la inmensidad del universo. "
+                "Al recitar o visualizar los versos: \"La cabeza toca el cielo, los pies se hunden en la tierra...\", tu mente se conecta con la naturaleza y reúne Hunyuan Chi puro en el centro de tu ser. "
+                "Esta alineación previa transforma un simple ejercicio físico en una meditación profunda y efectiva. "
+                "Los Ocho Versos preparan el terreno para que la energía fluya sin obstáculos durante toda tu práctica. "
+                "Dedica siempre unos minutos a sintonizar tu mente antes de mover tu cuerpo."
             ),
             "script_en": (
-                "Head touches heaven, feet stand firm on earth. The body relaxes and mind expands into the boundless cosmic void. "
-                "The Eight Verses composed by Dr. Pang Ming serve as the master key to establish the ideal Qi Field before every practice. "
-                "Contemplating these verses quiets the internal dialogue and establishes profound resonance with the universe. "
-                "They form the sacred bridge aligning human consciousness with cosmic harmony."
+                "Before starting any ZhiNeng QiGong practice, we align our state of mind using the traditional Eight Verses created by Dr. Pang Ming. "
+                "These eight verses serve as a poetic and scientific guide to adjust physical posture, relax the body, and expand the mind into the universe's vastness. "
+                "As you recite or visualize the verses: \"The head touches the sky, feet stand deep into the earth...\", your mind connects with nature and gathers pure Hunyuan Qi into the center of your being. "
+                "This preliminary alignment elevates simple physical exercise into a profound, effective meditation. "
+                "The Eight Verses prepare the energetic foundation for Qi to flow unobstructed throughout your entire practice. "
+                "Always spend a few quiet moments tuning your mind before moving your body."
             ),
             "desc_es": "Los 8 Versos de ZhiNeng QiGong: La estructura para sincronizar mente, cuerpo y cosmos antes de practicar.",
             "desc_en": "The Eight Verses of ZhiNeng QiGong: The sacred framework to harmonize mind, body, and universe.",
@@ -840,16 +945,20 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep14_salud_longevidad_res1.jpg"),
             "materials": [curated_clips.get("ep14_res1", sd_cell), p_clip2, curated_clips.get("ep14_res2", sd_spine), p_clip4, sd_meridian],
             "script_es": (
-                "La verdadera medicina no es reaccionar a la enfermedad, sino cultivar la vitalidad diaria. "
-                "Chineng Chikung no solo sirve para recuperarse de dolencias crónicas, sino para blindar tu sistema inmunológico, "
-                "mantener tus órganos nutridos y disfrutar de una longevidad activa y lúcida. Al integrar la práctica en tu rutina, "
-                "rejuveneces tus células y mantienes una mente despierta sin importar los años que tengas."
+                "La meta fundamental del Chineng Chikung es cultivar una vida de salud óptima, vitalidad constante y longevidad plena. "
+                "En la sociedad moderna, solemos aceptar el envejecimiento prematuro, el cansancio crónico y la enfermedad como inevitables. "
+                "Sin embargo, la perspectiva del Chineng Chikung demuestra que al nutrir el cuerpo con Hunyuan Chi y mantener la mente en un estado de armonía y gratitud, "
+                "las células conservan su capacidad de renovación por décadas. La verdadera longevidad no consiste únicamente en sumar años a la vida, sino en llenar cada año de vitalidad, claridad mental y alegría de servir a los demás. "
+                "Al practicar diariamente, proteges tu reserva energética y construyes una vejez fuerte, lúcida y feliz. "
+                "Invierte hoy en tu salud futura cultivando tu energía vital con dedicación y constancia."
             ),
             "script_en": (
-                "True healthcare is not merely treating symptoms; it is cultivating vibrant daily wellness. "
-                "ZhiNeng QiGong not only helps reverse chronic illness, but fortifies your immune defenses, nourishes internal organs, "
-                "and nurtures active, clear-minded longevity. By integrating conscious practice into your daily rhythm, you rejuvenate "
-                "your cellular health and maintain youthful vitality regardless of chronological age."
+                "The ultimate vision of ZhiNeng QiGong is to cultivate optimal health, continuous vitality, and a long, vibrant life. "
+                "In modern society, we often accept premature aging, chronic fatigue, and illness as inevitable. "
+                "However, ZhiNeng QiGong proves that by nourishing the body with Hunyuan Qi and keeping the mind in harmony and gratitude, "
+                "your cells retain their regenerative capacity for decades. True longevity is not merely about adding years to life, but bringing vitality, mental clarity, and joy into every single year. "
+                "Through daily practice, you protect your energy reserves and build a strong, lucid, and happy future. "
+                "Invest in your long-term health today by cultivating your vital energy with dedication and consistency."
             ),
             "desc_es": "Longevidad y Vitalidad: Cómo el ZhiNeng QiGong regenera tu cuerpo y fortalece tu sistema inmune cada día.",
             "desc_en": "Longevity and Vitality: How ZhiNeng QiGong cellular rejuvenation supports lifelong wellness.",
@@ -874,16 +983,20 @@ def main():
             "cover_bg": str(BANCO_EXISTENTE / "ep15_practica_autonoma_comunidad_res1.jpg"),
             "materials": [curated_clips.get("ep15_res1", sd_nebula), p_clip3, curated_clips.get("ep15_res2", sd_mind), p_clip5, sd_meridian],
             "script_es": (
-                "El mayor regalo que te brinda Chineng Chikung es la soberanía sobre tu propia vida. Aprender a gestionar "
-                "tu propia energía te libera del miedo y te devuelve el poder de cuidar de tu salud y la de tu familia. "
-                "En Sembradores de Chi te acompañamos con sesiones, campo compartido y las bases teóricas para que camines con confianza. "
-                "Sé parte de esta comunidad y comienza a transformar tu realidad hoy mismo."
+                "Has recorrido los fundamentos de la ciencia del Chineng Chikung. Ahora, el paso más importante es integrar este conocimiento en tu vida cotidiana a través de la práctica autónoma. "
+                "La verdadera transformación no sucede leyendo libros o viendo videos, sino sintiendo el Chi en tu propio cuerpo todos los días. "
+                "Dedicar al menos veinte minutos diarios a practicar Levantar y Verter el Chi, Sentadillas de Pared o meditación en el Campo de Chi creará un hábito transformador en tu biología. "
+                "La constancia es el secreto para consolidar la salud y mantener la mente serena ante cualquier desafío. "
+                "Te invitamos a formar parte de nuestra comunidad de Sembradores de Chi, donde compartimos práctica, conocimiento y apoyo mutuo. "
+                "Empieza hoy tu camino diario hacia la maestría de tu energía y tu vida."
             ),
             "script_en": (
-                "The supreme gift of ZhiNeng QiGong is complete sovereignty over your own life. Learning to manage your own Qi "
-                "frees you from anxiety and restores your innate power to care for your health and support your loved ones. "
-                "At Qi Sowers, we walk alongside you with guided sessions, collective Qi fields, and pure teachings so you can flourish. "
-                "Join our community and begin transforming your reality today."
+                "You have explored the foundational pillars of ZhiNeng QiGong science. Now, the most crucial step is integrating this wisdom into your daily life through autonomous practice. "
+                "True transformation does not occur merely by reading books or watching videos, but by feeling Qi in your own body every single day. "
+                "Dedicating just twenty minutes daily to practicing Lift Qi Up Pour Qi Down, Wall Squats, or Qi Field meditation creates a life-changing habit in your biology. "
+                "Consistency is the key to locking in vibrant health and maintaining inner serenity through any challenge. "
+                "We invite you to join our Qi Sowers community, where we share practice, knowledge, and mutual support. "
+                "Begin your daily journey today toward mastering your energy and your life."
             ),
             "desc_es": "Soberanía y Comunidad: Únete a Sembradores de Qì y haz del ZhiNeng QiGong tu estilo de vida consciente.",
             "desc_en": "Sovereignty and Community: Join Qi Sowers and make ZhiNeng QiGong your daily path to conscious wellness.",
@@ -950,12 +1063,12 @@ def main():
         out_es = OUTPUT_BASE / f"{ep['num']}_{ep['base_name']}_ES.mp4"
         logger.info(f"--- Generando Video ES: {out_es.name} ---")
         produce_single_video(
-            video_subject=ep["title_es"],
-            script_text=ep["script_es"],
-            voice_name="es-MX-JorgeNeural-Male",
-            materials=ep["materials"],
+            ep=ep,
+            lang="ES",
+            voice_name="es-MX-JorgeNeural",
             out_path=out_es,
-            replacements=replacements_es
+            replacements=replacements_es,
+            force_rebuild=True
         )
         total_produced += 1
 
@@ -963,12 +1076,12 @@ def main():
         out_en = OUTPUT_BASE / f"{ep['num']}_{ep['base_name']}_EN.mp4"
         logger.info(f"--- Generando Video EN: {out_en.name} ---")
         produce_single_video(
-            video_subject=ep["title_en"],
-            script_text=ep["script_en"],
-            voice_name="en-US-ChristopherNeural-Male",
-            materials=ep["materials"],
+            ep=ep,
+            lang="EN",
+            voice_name="en-US-ChristopherNeural",
             out_path=out_en,
-            replacements=replacements_en
+            replacements=replacements_en,
+            force_rebuild=True
         )
         total_produced += 1
 
